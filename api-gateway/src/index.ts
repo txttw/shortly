@@ -444,7 +444,7 @@ for (const r of proxiedRoutes) {
         }
 
         const origins = c.env.SERVICE_ORIGINS
-        console.log(`http://${origins[r.service]}${c.req.path}`)
+
         // We could rewrite the request e.g. from /users -> / if the service only handles requests related to 1 resource type, in this case User
         return proxy(
             `http://${origins[r.service]}${c.req.path}`,
