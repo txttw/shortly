@@ -1,0 +1,48 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated/prisma"
+  //previewFeatures = ["driverAdapters"] // change from default
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id    String @id  @default(uuid())
+  v	Int
+  deletedAt DateTime?
+  links Link[]
+}
+
+model Link {
+  id    String @id
+  short	String @unique
+  long String
+  user User @relation(fields: [userId], references: [id], onUpdate: Cascade, onDelete: Cascade)
+  userId String
+  v	Int
+  lookups Lookup[]
+  count Int @default(0)
+  expiresAt DateTime
+  deletedAt DateTime?
+  @@index([short, userId])
+  @@unique([short, deletedAt])
+  @@index([short, expiresAt])
+}
+
+model Lookup {
+  id  Int @id @default(autoincrement())
+  link Link @relation(fields: [linkId], references: [id], onUpdate: Cascade, onDelete: Cascade)
+  linkId String
+  timestamp DateTime
+  @@index([linkId, timestamp(sort: Desc)])
+}
+

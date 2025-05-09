@@ -1,0 +1,76 @@
+{
+    "$schema": "node_modules/wrangler/config-schema.json",
+    "name": "shortly-api-gateway",
+    "main": "src/index.ts",
+    "compatibility_date": "2025-04-28",
+    "compatibility_flags": ["nodejs_compat"],
+    "dev": {
+        //"ip": "192.168.1.1",
+        "port": 8080,
+        "local_protocol": "http"
+    },
+    "vars": {
+        "SERVICE_ORIGINS": {
+            "users": "shortly-users.tamas-munka.workers.dev",
+            "links": "shortly-links.tamas-munka.workers.dev",
+            "analytics": "shortly-analytics.tamas-munka.workers.dev"
+        }
+    },
+    "kv_namespaces": [
+        {
+            "binding": "KV_API_KEYS",
+            "id": "9746479e228141dba62826d625d9f127"
+        },
+        {
+            "binding": "KV_REFRESH_TOKENS",
+            "id": "d83168c53794444a9494c67707aa8e04"
+        }
+    ],
+    "route": {
+        "pattern": "api.shortly.txttw.online",
+        "custom_domain": true
+    },
+    // "r2_buckets": [
+    //   {
+    //     "binding": "MY_BUCKET",
+    //     "bucket_name": "my-bucket"
+    //   }
+    // ],
+    //"d1_databases": [
+    //  {
+    //  	"binding": "DB",
+    //  	"database_name": "shortly-api-gateway",
+    //  	"database_id": "c08b2598-c3e1-48c2-8302-9dc42e3cbc56"
+    //  }
+    //],
+    "queues": {
+        "consumers": [
+            {
+                "queue": "shortly-users-api-gw",
+                "max_batch_size": 20,
+                "max_batch_timeout": 5
+            }
+        ]
+    },
+    "services": [
+        {
+            "binding": "SERVICE_USERS",
+            "service": "shortly-users"
+        },
+        {
+            "binding": "SERVICE_LINKS",
+            "service": "shortly-links"
+        },
+        {
+            "binding": "SERVICE_ANALYTICS",
+            "service": "shortly-analytics"
+        }
+    ]
+    // "ai": {
+    //   "binding": "AI"
+    // },
+    // "observability": {
+    //   "enabled": true,
+    //   "head_sampling_rate": 1
+    // }
+}

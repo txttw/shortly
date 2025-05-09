@@ -1,0 +1,64 @@
+{
+    "$schema": "node_modules/wrangler/config-schema.json",
+    "name": "shortly-links",
+    "main": "src/index.ts",
+    "compatibility_date": "2025-04-28",
+    "compatibility_flags": ["nodejs_compat"],
+    "dev": {
+        //"ip": "192.168.1.1",
+        "port": 8082,
+        "local_protocol": "http"
+    },
+    // "vars": {
+    //   "MY_VAR": "my-variable"
+    // },
+    // "kv_namespaces": [
+    //   {
+    //     "binding": "MY_KV_NAMESPACE",
+    //     "id": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    //   }
+    // ],
+    // "r2_buckets": [
+    //   {
+    //     "binding": "MY_BUCKET",
+    //     "bucket_name": "my-bucket"
+    //   }
+    // ],
+    //"d1_databases": [
+    //  {
+    //  	"binding": "DB",
+    //  	"database_name": "shortly-links",
+    //  	"database_id": "bd048c99-d7e5-43b3-89ee-2a1285b09e2e"
+    //  }
+    //],
+    "queues": {
+        "producers": [
+            {
+                "queue": "shortly-links-analytics",
+                "binding": "LINKS_ANALYTICS_QUEUE"
+            },
+            {
+                "queue": "shortly-links-lookups",
+                "binding": "LINKS_LOOKUPS_QUEUE"
+            },
+            {
+                "queue": "shortly-links-users",
+                "binding": "LINKS_USERS_QUEUE"
+            }
+        ],
+        "consumers": [
+            {
+                "queue": "shortly-users-links",
+                "max_batch_size": 20,
+                "max_batch_timeout": 5
+            }
+        ]
+    }
+    // "ai": {
+    //   "binding": "AI"
+    // },
+    // "observability": {
+    //   "enabled": true,
+    //   "head_sampling_rate": 1
+    // }
+}
