@@ -13,13 +13,17 @@ export function createEventData<T>(queues: string[], data: T) {
 
 export async function sendEvents(
     eventModelDelegate: any,
-    events: ResourceChangedEventDescriptor[],
     send: (queue: string, data: any) => Promise<void>
 ) {
+    const events = (await eventModelDelegate.findMany({
+        where: {
+            sentAt: null,
+        },
+    })) as ResourceChangedEventDescriptor[]
     const processedIds: number[] = []
     for (const event of events) {
         try {
-            await send(event.queue, JSON.parse(event.data))
+            await send(event.queue, event)
             processedIds.push(event.id)
         } catch (err) {
             // We will retry later

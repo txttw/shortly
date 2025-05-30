@@ -18,6 +18,7 @@
     "hono": "^4.7.8",
     "hono-openapi": "^0.4.7",
     "nanoid": "^5.1.5",
+    "qs-esm": "^7.0.2",
     "shortly-shared": "file:../shared",
     "zod": "^3.24.3",
     "zod-openapi": "^4.2.4"

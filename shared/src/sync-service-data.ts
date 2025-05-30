@@ -1,4 +1,7 @@
-import { ModelChangedEventData } from './message-definitions'
+import {
+    ModelChangedEventData,
+    ResourceChangedEventDescriptor,
+} from './message-definitions'
 import { MessageBatch } from './queue-types'
 
 export abstract class SyncServiceData<T, M extends ModelChangedEventData, R> {
@@ -8,6 +11,7 @@ export abstract class SyncServiceData<T, M extends ModelChangedEventData, R> {
         id: string
         v: number
     }): Promise<R | null>
+
     constructor(protected prisma: T) {}
     createAck(ack: boolean, model: any = null) {
         return { ack, model }
@@ -59,10 +63,12 @@ export abstract class SyncServiceData<T, M extends ModelChangedEventData, R> {
             return this.createAck(false)
         }
     }
-    async sync(batch: MessageBatch<M>): Promise<{ ack: boolean; model: R }[]> {
+    async sync(
+        batch: MessageBatch<ResourceChangedEventDescriptor>
+    ): Promise<{ ack: boolean; model: R }[]> {
         const results = []
         for (const message of batch.messages) {
-            const data = message.body
+            const data = JSON.parse(message.body.data) as M
             // Delete is an update with deletedAt field
             const result =
                 data.v === 0 ? await this.create(data) : await this.update(data)

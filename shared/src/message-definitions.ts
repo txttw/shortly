@@ -1,4 +1,4 @@
-import { Scopes } from './scopes'
+import { Permissions } from './permissions'
 
 export type WithOptional<T, K extends keyof T> = Omit<T, K> &
     Partial<Pick<T, K>>
@@ -19,7 +19,7 @@ export interface ResourceChangedEventDescriptor {
 export interface UserChangedEventData extends ModelChangedEventData {
     username: string
     password: string
-    scopes: Scopes[]
+    permissions: Permissions[]
 }
 export interface LinkChangedEventData extends ModelChangedEventData {
     short: string

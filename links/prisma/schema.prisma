@@ -18,8 +18,10 @@ datasource db {
 model User {
   id    String @id
   v	Int
+  username String
   deletedAt DateTime?
   @@index([id, deletedAt])
+  @@index([username, deletedAt])
   links Link[]
 }
 
@@ -45,5 +47,6 @@ model LinkChangedEvent {
   data	String
   createdAt DateTime @default(now())
   sentAt DateTime?
+  failedAt DateTime?
   @@index(sentAt)
 }

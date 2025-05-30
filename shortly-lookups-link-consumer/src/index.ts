@@ -1,4 +1,7 @@
-import { LinkChangedEventData } from 'shortly-shared'
+import {
+    LinkChangedEventData,
+    ResourceChangedEventDescriptor,
+} from 'shortly-shared'
 
 type Bindings = {
     KV: KVNamespace
@@ -7,11 +10,11 @@ type Bindings = {
 export default {
     // The queue handler is invoked when a batch of messages is ready to be delivered
     async queue(
-        batch: MessageBatch<LinkChangedEventData>,
+        batch: MessageBatch<ResourceChangedEventDescriptor>,
         env: Bindings
     ): Promise<void> {
         for (let message of batch.messages) {
-            const data = message.body
+            const data = JSON.parse(message.body.data) as LinkChangedEventData
             // create
             try {
                 if (data.v === 0) {
@@ -37,9 +40,10 @@ export default {
                     }
                 }
             } catch (err: any) {
+                console.log(err)
                 // Retry
             }
             message.retry()
         }
     },
-} satisfies ExportedHandler<Env, LinkChangedEventData>
+} satisfies ExportedHandler<Env, ResourceChangedEventDescriptor>

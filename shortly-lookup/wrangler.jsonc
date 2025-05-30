@@ -15,6 +15,9 @@
         "port": 8085,
         "local_protocol": "http"
     },
+    "vars": {
+        "REDIRECT_404": "https://app.shortly.txttw.online/redirect/404"
+    },
     "queues": {
         "producers": [
             {
@@ -31,7 +34,7 @@
     ],
     "route": {
         "pattern": "shortly.txttw.online",
-        "custom_domain": true
+        "zone_name": "txttw.online"
     }
     /**
      * Smart Placement

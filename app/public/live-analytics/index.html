@@ -69,7 +69,9 @@
         }
 
         analytics_service = new WebSocket(
-          `wss://live.shortly.txttw.online/websocket?token=${token}`
+          `ws://live.shortly.txttw.online/websocket?token=${token}`
+          //`ws://127.0.0.1:8787/websocket?token=${token}`
+
         );
         analytics_service.onmessage = function (event) {
           const data = JSON.parse(event.data);

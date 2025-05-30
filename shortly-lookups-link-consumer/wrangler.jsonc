@@ -18,7 +18,11 @@
     "queues": {
         "consumers": [
             {
-                "queue": "shortly-links-lookups"
+                "queue": "shortly-links-lookups",
+                "max_batch_size": 20,
+                "max_batch_timeout": 2,
+                "retry_delay": 5,
+                "dead_letter_queue": "shortly-links-dlq"
             }
         ]
     },

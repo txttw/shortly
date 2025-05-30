@@ -1,7 +1,6 @@
 import {
     LinkChangedEventData,
-    LookupCreatedEventData,
-    UserChangedEventData,
+    ResourceChangedEventDescriptor,
 } from 'shortly-shared'
 import { SyncServiceData } from 'shortly-shared'
 import { PrismaClientAccelerated } from '../lib/prismaClient'
@@ -50,4 +49,21 @@ export class SyncLinkData extends SyncServiceData<
     }): Promise<LinkModelData | null> {
         return await this.prisma.link.findUnique({ where })
     }
+}
+
+export async function handleDLQ(
+    prisma: PrismaClientAccelerated,
+    batch: MessageBatch<ResourceChangedEventDescriptor>
+) {
+    const eventIds = batch.messages.map((m) => m.body.id)
+    await prisma.userChangedEvent.updateMany({
+        where: {
+            id: {
+                in: eventIds,
+            },
+        },
+        data: {
+            failedAt: new Date(),
+        },
+    })
 }

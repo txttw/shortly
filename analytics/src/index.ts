@@ -1,34 +1,50 @@
 import { Hono } from 'hono/quick'
-import { z } from 'zod'
+import { cors } from 'hono/cors'
+import { ZodError } from 'zod'
 import 'zod-openapi/extend'
-
+import * as qs from 'qs-esm'
 import prismaClients from '../lib/prismaClient'
 
 import { describeRoute, openAPISpecs } from 'hono-openapi'
 import { resolver, validator as zValidator } from 'hono-openapi/zod'
 
 import {
-    appDefaults,
+    corsOptions,
     CustomError,
-    NotAllowedError,
     NotFoundError,
+    Permissions,
+    ResourceChangedEventDescriptor,
     UnexpectedError,
 } from 'shortly-shared'
-import {
-    LinkChangedEventData,
-    LookupCreatedEventData,
-    UserChangedEventData,
-} from 'shortly-shared'
+import { LookupCreatedEventData } from 'shortly-shared'
 
 import { saveLookups, SyncLinkData, SyncUserData } from './event-processing'
 import {
     authorizeReadAnalytics,
-    getAuthorizationData,
+    authenticateMiddleware,
 } from './middleware/authorization'
+import {
+    linksQuerySchema,
+    paginatedLinksResponseSchema,
+} from './validation/links'
+import { Prisma } from './generated/prisma'
+import {
+    lookupsParamLinkIdSchema,
+    lookupsQuerySchema,
+    paginatedLookupsResponseSchema,
+} from './validation/lookups'
+import {
+    linksStatQuerySchema,
+    linksStatResponeSchema,
+    lookupsStatResponeSchema,
+    lookupStatQuerySchema,
+} from './validation/stat'
 
-// APP CONFIG
-// TODO We could read from DB
-const appConfig = appDefaults
+// @ts-ignore
+BigInt.prototype.toJSON = function () {
+    const int = Number.parseInt(this.toString())
+    return int ?? this.toString()
+}
 
 type Bindings = {
     DATABASE_URL: string
@@ -44,93 +60,345 @@ enum ConsumerQueues {
 
 const app = new Hono<{ Bindings: Bindings }>()
 
-const reqSchema = z.object({
-    short: z.string().length(appConfig.shortLength),
-})
-
-const querySchema = z.object({
-    limit: z.optional(z.string().regex(/^\d{1,3}$/)).default('5'),
-})
-
-const AnalyticsSchema = z.object({
-    link: z.object({
-        id: z.string(),
-        short: z.string().length(appConfig.shortLength),
-        count: z.number(),
-    }),
-    recent: z.array(z.string().datetime()),
-})
+app.use('*', cors(corsOptions))
 
 app.get(
-    '/analytics/:short',
+    '/analytics/links',
     describeRoute({
-        description: 'Provides analytics data for a short link',
+        description: 'Retrieve link resources for analytics',
         responses: {
             200: {
                 description: 'Successful response',
                 content: {
                     'application/json': {
-                        schema: resolver(AnalyticsSchema),
+                        schema: resolver(paginatedLinksResponseSchema),
                     },
                 },
             },
         },
     }),
-    getAuthorizationData,
+    authenticateMiddleware,
     authorizeReadAnalytics,
-    zValidator('param', reqSchema),
-    zValidator('query', querySchema),
-    async (c) => {
-        const { short } = c.req.valid('param')
-        const { limit } = c.req.valid('query')
-        const prisma = prismaClients.fetch(c.env.DATABASE_URL)
 
-        const link = await prisma.link.findUnique({
-            where: {
-                short,
-                deletedAt: null,
-                user: {
-                    id: c.var.authUserId,
-                    deletedAt: null,
+    async (c) => {
+        const search = new URL(c.req.url).search.slice(1)
+        const query = linksQuerySchema.parse(qs.parse(search))
+
+        const page = query?.page || 1
+        const limit = query?.limit || 10
+
+        const whereQuery: Prisma.LinkWhereInput = query?.where || {}
+
+        // If doesnt have Permissions.Analytics_ReadAll only return Links created by the user
+        if (c.var.permissions.has(Permissions.Analytics_ReadAll)) {
+            whereQuery.user = query?.where?.user
+        } else {
+            whereQuery.user = undefined
+            whereQuery.userId = c.var.authUserId
+        }
+
+        const prisma = prismaClients.fetch(c.env.DATABASE_URL)
+        const links = await prisma.link.findMany({
+            where: { ...whereQuery, deletedAt: null },
+            orderBy: query?.sort || undefined,
+            omit: {
+                deletedAt: true,
+                v: true,
+            },
+            skip: (page - 1) * limit,
+            take: limit + 1,
+            include:
+                Object.keys(query?.include || {}).length > 0
+                    ? {
+                          user: query?.include?.user
+                              ? {
+                                    select: {
+                                        id: true,
+                                        username: true,
+                                    },
+                                }
+                              : undefined,
+                          lookups: query?.include?.lookups
+                              ? {
+                                    select: {
+                                        timestamp: true,
+                                    },
+                                    orderBy: {
+                                        timestamp: 'desc',
+                                    },
+                                    take: 10,
+                                }
+                              : undefined,
+                      }
+                    : undefined,
+        })
+
+        const hasNextPage = links.length > limit
+        if (hasNextPage) links.pop()
+
+        return c.json({
+            docs: links,
+            pagination: {
+                page,
+                limit,
+                hasNextPage,
+                prev: page > 1 ? page - 1 : null,
+                next: hasNextPage ? page + 1 : null,
+            },
+        })
+    }
+)
+
+app.get(
+    '/analytics/links/:linkId/lookups',
+    describeRoute({
+        description: 'Retrieve lookup resources for analytics',
+        responses: {
+            200: {
+                description: 'Successful response',
+                content: {
+                    'application/json': {
+                        schema: resolver(paginatedLookupsResponseSchema),
+                    },
                 },
             },
+        },
+    }),
+    authenticateMiddleware,
+    authorizeReadAnalytics,
+    zValidator('param', lookupsParamLinkIdSchema),
+    async (c) => {
+        const { linkId } = c.req.valid('param')
+        const search = new URL(c.req.url).search.slice(1)
+        const query = lookupsQuerySchema.parse(qs.parse(search))
+
+        const page = query?.page || 1
+        const limit = query?.limit || 10
+
+        const whereQuery: Prisma.LookupWhereInput = query?.where || {}
+
+        // If doesnt have Permissions.Analytics_ReadAll only return Links created by the user
+        whereQuery.link = {
+            id: linkId,
+            userId: !c.var.permissions.has(Permissions.Analytics_ReadAll)
+                ? c.var.authUserId
+                : undefined,
+            deletedAt: null,
+        }
+
+        const prisma = prismaClients.fetch(c.env.DATABASE_URL)
+        const lookups = await prisma.lookup.findMany({
+            where: whereQuery,
+            orderBy: query?.sort || undefined,
+            skip: (page - 1) * limit,
+            take: limit + 1,
             select: {
-                v: false,
-                deletedAt: false,
-                expiresAt: true,
                 id: true,
-                short: true,
-                long: true,
-                count: true,
-                lookups: {
-                    select: {
-                        timestamp: true,
-                    },
-                    orderBy: {
-                        timestamp: 'desc',
-                    },
-                    take: Math.min(Math.max(Number(limit), 0), 100),
-                },
+                timestamp: true,
             },
         })
 
+        const hasNextPage = lookups.length > limit
+        if (hasNextPage) lookups.pop()
+
+        return c.json({
+            docs: lookups,
+            pagination: {
+                page,
+                limit,
+                hasNextPage,
+                prev: page > 1 ? page - 1 : null,
+                next: hasNextPage ? page + 1 : null,
+            },
+        })
+    }
+)
+
+app.get(
+    '/analytics/links/stats',
+    describeRoute({
+        description: 'Retrieve statistics for links',
+        responses: {
+            200: {
+                description: 'Successful response',
+                content: {
+                    'application/json': {
+                        schema: resolver(linksStatResponeSchema),
+                    },
+                },
+            },
+        },
+    }),
+    authenticateMiddleware,
+    authorizeReadAnalytics,
+    async (c) => {
+        const search = new URL(c.req.url).search.slice(1)
+        const query = linksStatQuerySchema.parse(qs.parse(search))
+
+        const deletedAtQuery = {
+            OR: [
+                {
+                    deletedAt: null,
+                },
+                ...(query?.statPeriod
+                    ? [
+                          {
+                              deletedAt: {
+                                  gt: query?.statPeriod?.lt,
+                              },
+                          },
+                      ]
+                    : []),
+            ],
+        }
+
+        const prisma = prismaClients.fetch(c.env.DATABASE_URL)
+        const stats = await prisma.link.aggregate({
+            where: {
+                userId: !c.var.permissions.has(Permissions.Analytics_ReadAll)
+                    ? c.var.authUserId
+                    : undefined,
+
+                expiresAt: query?.statPeriod,
+                ...deletedAtQuery,
+            },
+            _count: {
+                id: true,
+            },
+            _sum: {
+                count: true,
+            },
+        })
+
+        return c.json({
+            stats: {
+                links: stats._count.id,
+                lookups: stats._sum.count,
+            },
+        })
+    }
+)
+
+app.get(
+    '/analytics/links/:linkId/stats',
+    describeRoute({
+        description: 'Retrieve statistics for links',
+        responses: {
+            200: {
+                description: 'Successful response',
+                content: {
+                    'application/json': {
+                        schema: resolver(lookupsStatResponeSchema),
+                    },
+                },
+            },
+        },
+    }),
+    authenticateMiddleware,
+    authorizeReadAnalytics,
+    zValidator('param', lookupsParamLinkIdSchema),
+    async (c) => {
+        const { linkId } = c.req.valid('param')
+        const search = new URL(c.req.url).search.slice(1)
+        const query = lookupStatQuerySchema.parse(qs.parse(search))
+
+        const deletedAtQuery = {
+            OR: [
+                {
+                    deletedAt: null,
+                },
+                ...(query?.statPeriod
+                    ? [
+                          {
+                              deletedAt: {
+                                  gt: query?.statPeriod?.lt,
+                              },
+                          },
+                      ]
+                    : []),
+            ],
+        }
+
+        const prisma = prismaClients.fetch(c.env.DATABASE_URL)
+        // Find link
+        const link = await prisma.link.findUnique({
+            where: {
+                id: linkId,
+                userId: !c.var.permissions.has(Permissions.Analytics_ReadAll)
+                    ? c.var.authUserId
+                    : undefined,
+                ...deletedAtQuery,
+            },
+            omit: {
+                v: true,
+                deletedAt: true,
+            },
+        })
         if (!link) {
             throw new NotFoundError()
         }
 
-        return c.json({ link })
+        // Raw query because prisma doesnt support date_part function
+        if (query?.groupBy) {
+            const statPeriod = query?.statPeriod
+            let lookupWhere = ''
+            let params: string[] = []
+            if (statPeriod?.lt && statPeriod?.gt) {
+                lookupWhere = `"timestamp" BETWEEN $2::timestamp AND $3::timestamp`
+                params = [statPeriod.gt, statPeriod.lt]
+            } else if (statPeriod?.lt) {
+                lookupWhere = `"timestamp" <= $2::timestamp`
+                params = [statPeriod.lt]
+            } else if (statPeriod?.gt) {
+                lookupWhere = `"timestamp" >= $2::timestamp`
+                params = [statPeriod.gt]
+            }
+
+            const groupBy = query.groupBy
+            const grouppedStats = await prisma.$queryRawUnsafe(
+                `SELECT date_trunc('${groupBy}', "timestamp") as group, count(*) ` +
+                    `FROM "Lookup" ` +
+                    `WHERE "linkId" = $1 ${
+                        lookupWhere ? `AND ${lookupWhere}` : ''
+                    } ` +
+                    `GROUP BY date_trunc('${groupBy}', "timestamp") ` +
+                    `ORDER BY "group" ASC;`,
+                ...[link.id, ...params]
+            )
+
+            return c.json({
+                link,
+                stats: { lookups: grouppedStats },
+            })
+        } else {
+            const lookupCount = await prisma.lookup.count({
+                where: {
+                    linkId: link.id,
+                    timestamp: query?.statPeriod,
+                },
+            })
+            return c.json({
+                link,
+                stats: {
+                    lookups: lookupCount,
+                },
+            })
+        }
     }
 )
 
 app.onError((err, c) => {
-    console.log(err)
+    if (err instanceof ZodError) {
+        c.status(422)
+        return c.json({ error: err })
+    }
     const e = err instanceof CustomError ? err : new UnexpectedError()
     c.status(e.status)
     return c.json(e.toMessage())
 })
 
 app.get(
-    '/analytics/doc/openapi',
+    '/analytics/schema/openapi',
     openAPISpecs(app, {
         documentation: {
             info: {
@@ -155,17 +423,14 @@ export default {
         switch (batch.queue) {
             case ConsumerQueues.USERS_ANALYTICS_QUEUE:
                 await new SyncUserData(prisma).sync(
-                    batch as MessageBatch<UserChangedEventData>
+                    batch as MessageBatch<ResourceChangedEventDescriptor>
                 )
                 break
             case ConsumerQueues.LINKS_ANALYTICS_QUEUE:
-                try {
-                    await new SyncLinkData(prisma).sync(
-                        batch as MessageBatch<LinkChangedEventData>
-                    )
-                } catch (err) {
-                    console.log(err)
-                }
+                await new SyncLinkData(prisma).sync(
+                    batch as MessageBatch<ResourceChangedEventDescriptor>
+                )
+
                 break
             case ConsumerQueues.LOOKUPS_ANALYTICS_QUEUE:
                 const linksUpdated = await saveLookups(

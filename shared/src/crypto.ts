@@ -1,3 +1,10 @@
+import {
+    JwtTokenInvalidExpired,
+    JwtTokenInvalidFormat,
+    JwtTokenInvalidSignature,
+} from './errors'
+import { base64Decode } from './utils'
+
 export async function hashPassword(
     password: string,
     providedSalt?: Uint8Array
@@ -72,4 +79,51 @@ export async function sign(key: string, data: string): Promise<string> {
         .map((b) => b.toString(16).padStart(2, '0'))
         .join('')
     return signatureHex
+}
+
+// This is for services without a framework
+export async function verifyJWT(
+    key: string,
+    token: string
+): Promise<{ [key: string]: unknown }> {
+    let enc = new TextEncoder()
+
+    const cryptoKey = await crypto.subtle.importKey(
+        'raw',
+        enc.encode(key),
+        { name: 'HMAC', hash: 'SHA-256' },
+        false,
+        ['verify']
+    )
+    const parts = token.split('.')
+
+    if (parts.length !== 3) {
+        throw new JwtTokenInvalidFormat()
+    }
+
+    const [header, payload, signature] = parts
+
+    const decodedHeader = JSON.parse(base64Decode(header))
+    if (decodedHeader.alg !== 'HS256' && decodedHeader.typ !== 'JWT') {
+        throw new JwtTokenInvalidFormat()
+    }
+
+    const now = Date.now() / 1e3
+    const decodedPayload = JSON.parse(base64Decode(payload))
+    if (decodedPayload.exp && decodedPayload.exp <= now) {
+        throw new JwtTokenInvalidExpired()
+    }
+
+    const signatureValid = await crypto.subtle.verify(
+        'HMAC',
+        cryptoKey,
+        Buffer.from(signature, 'base64'),
+        enc.encode(parts.slice(0, 2).join('.'))
+    )
+
+    if (!signatureValid) {
+        throw new JwtTokenInvalidSignature()
+    }
+
+    return decodedPayload
 }

@@ -9,6 +9,7 @@ import { PrismaClientAccelerated } from '../lib/prismaClient'
 interface UserModelData {
     id: string
     v: number
+    username: string
     deletedAt: Date | null
 }
 
@@ -17,6 +18,7 @@ interface LinkModelData {
     id: string
     v: number
     deletedAt: Date | null
+    lastLookup: Date | null
     expiresAt: Date
     short: string
     long: string
@@ -32,6 +34,7 @@ export class SyncUserData extends SyncServiceData<
         return await this.prisma.user.create({
             data: {
                 id: data.id,
+                username: data.username,
                 v: data.v,
                 deletedAt: data.deletedAt,
             },
@@ -41,13 +44,19 @@ export class SyncUserData extends SyncServiceData<
         where: { id: string; v: number },
         data: UserChangedEventData
     ): Promise<UserModelData> {
-        return await this.prisma.user.update({
-            where,
-            data: {
-                v: data.v,
-                deletedAt: data.deletedAt,
-            },
-        })
+        try {
+            return await this.prisma.user.update({
+                where,
+                data: {
+                    username: data.username,
+                    v: data.v,
+                    deletedAt: data.deletedAt,
+                },
+            })
+        } catch (err) {
+            console.log(err)
+            throw err
+        }
     }
     async findUniqueModel(where: {
         id: string
@@ -80,16 +89,28 @@ export class SyncLinkData extends SyncServiceData<
         where: { id: string; v: number },
         data: LinkChangedEventData
     ): Promise<LinkModelData> {
-        return await this.prisma.link.update({
-            where,
-            data: {
-                short: data.short,
-                long: data.long,
-                userId: data.userId,
-                v: data.v,
-                deletedAt: data.deletedAt,
-                expiresAt: data.expiresAt,
-            },
+        return await this.prisma.$transaction(async (tx) => {
+            const link = await tx.link.update({
+                where,
+                data: {
+                    short: data.short,
+                    long: data.long,
+                    userId: data.userId,
+                    v: data.v,
+                    deletedAt: data.deletedAt,
+                    expiresAt: data.expiresAt,
+                },
+            })
+            // Cascade delete all related lookups
+            // link has the last lookup timestamp and the count archived
+            if (link.deletedAt) {
+                await tx.lookup.deleteMany({
+                    where: {
+                        linkId: link.id,
+                    },
+                })
+            }
+            return link
         })
     }
     async findUniqueModel(where: {
@@ -123,7 +144,7 @@ export async function saveLookups(
                 },
             },
         })
-        const newLookupData = []
+        const newLookupData: LookupCreatedEventData[] = []
         for (const message of messagesByLinkId[linkId]) {
             const d = message.body
             const hasLookup = existingLookups.some(
@@ -133,6 +154,11 @@ export async function saveLookups(
                 newLookupData.push(d)
             }
         }
+        newLookupData.sort(
+            (a, b) =>
+                new Date(b.timestamp!).getTime() -
+                new Date(a.timestamp!).getTime()
+        )
         const [_, link] = await prisma.$transaction([
             prisma.lookup.createMany({ data: newLookupData }),
             prisma.link.update({
@@ -141,12 +167,11 @@ export async function saveLookups(
                 },
                 data: {
                     count: { increment: newLookupData.length },
+                    lastLookup: newLookupData[0].timestamp,
                 },
             }),
         ])
-        const timestamps = newLookupData
-            .map((lu) => lu.timestamp)
-            .sort((a, b) => a.getTime() - b.getTime())
+        const timestamps = newLookupData.map((lu) => lu.timestamp)
         links.push({ link, timestamps: timestamps.slice(0, 5) })
         // If the transaction did not throw we can ack the related messages
         for (const message of messagesByLinkId[linkId]) {

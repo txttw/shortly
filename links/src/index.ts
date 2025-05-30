@@ -1,34 +1,48 @@
 import { Hono } from 'hono/quick'
-import { RefinementCtx, z } from 'zod'
+import { cors } from 'hono/cors'
+import { ZodError } from 'zod'
 import 'zod-openapi/extend'
 
-import prismaClients, { PrismaClientAccelerated } from '../lib/prismaClient'
+import prismaClients from '../lib/prismaClient'
 
 import { describeRoute, openAPISpecs } from 'hono-openapi'
 import { resolver, validator as zValidator } from 'hono-openapi/zod'
 import { LinkAlreadyExists } from './errors'
 import {
+    corsOptions,
     createEventData,
     CustomError,
-    NotAllowedError,
     NotFoundError,
     PartialExceptVersion,
-    Scopes,
+    Permissions,
+    ResourceChangedEventDescriptor,
     UnexpectedError,
     UserChangedEventData,
 } from 'shortly-shared'
-import { LinkChangedEventData } from 'shortly-shared'
 import { sendEvents, appDefaults } from 'shortly-shared'
 import {
     addDays,
     generateStringWithValidation,
     readShortLinkFromDB,
 } from './utils'
-import { SyncUserData } from './event-processing'
+import { handleDLQ, SyncUserData } from './event-processing'
 import {
     authorizeLinkCreation,
-    getAuthorizationData,
+    authenticateMiddleware,
 } from './middleware/authorization'
+import {
+    bulkDeletedResponseSchema,
+    bulkDeleteParamSchema,
+    createLinkSchema,
+    linkResponeSchema,
+    listQuerySchema,
+    paginatedLinksResponseSchema,
+    paramLinkIdSchema,
+    updateLinkSchema,
+} from './validation/links'
+import * as qs from 'qs-esm'
+import { Prisma } from './generated/prisma'
+import { QueuesToProduce, updateQueues } from './queues'
 
 // APP CONFIG
 // TODO We could read from DB
@@ -46,47 +60,21 @@ type QueueBindings = {
 
 type Bindings = DBBindings & QueueBindings
 
-enum Queues {
-    LINKS_ANALYTICS_QUEUE = 'shortly-links-analytics',
-    LINKS_LOOKUPS_QUEUE = 'shortly-links-lookups',
-    LINKS_USERS_QUEUE = 'shortly-links-users',
+// consume from queue
+enum ConsumerQueues {
+    USERS_LINKS_QUEUE = 'shortly-users-links',
+    LINKS_DLQ = 'shortly-links-dlq',
 }
 
-const queueBindings: { [key in Queues]: keyof QueueBindings } = {
-    [Queues.LINKS_ANALYTICS_QUEUE]: 'LINKS_ANALYTICS_QUEUE',
-    [Queues.LINKS_LOOKUPS_QUEUE]: 'LINKS_LOOKUPS_QUEUE',
-    [Queues.LINKS_USERS_QUEUE]: 'LINKS_USERS_QUEUE',
+const queueBindings: { [key in QueuesToProduce]: keyof QueueBindings } = {
+    [QueuesToProduce.LINKS_ANALYTICS_QUEUE]: 'LINKS_ANALYTICS_QUEUE',
+    [QueuesToProduce.LINKS_LOOKUPS_QUEUE]: 'LINKS_LOOKUPS_QUEUE',
+    [QueuesToProduce.LINKS_USERS_QUEUE]: 'LINKS_USERS_QUEUE',
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
 
-const expires_at_validator = z
-    .string()
-    .datetime()
-    .superRefine((val: string, ctx: RefinementCtx) => {
-        if (new Date(val).getTime() <= new Date().getTime()) {
-            ctx.addIssue({
-                code: z.ZodIssueCode.invalid_date,
-                message: 'Date must be in the future',
-            })
-        }
-    })
-
-const createBodySchema = z.object({
-    long: z.string().url(),
-    short: z.optional(z.string().length(appConfig.shortLength)),
-    expiresAt: z.optional(expires_at_validator),
-})
-
-const LinkSchema = z.object({
-    username: z.string().openapi({ example: 'Steven' }),
-    id: z.string(),
-    short: z.string().length(6),
-    long: z.string().url(),
-    userId: z.string().uuid(),
-    createdAt: z.date(),
-    expiresAt: z.date(),
-})
+app.use('*', cors(corsOptions))
 
 app.post(
     '/links',
@@ -97,15 +85,15 @@ app.post(
                 description: 'Successful response',
                 content: {
                     'application/json': {
-                        schema: resolver(LinkSchema),
+                        schema: resolver(linkResponeSchema),
                     },
                 },
             },
         },
     }),
-    getAuthorizationData,
+    authenticateMiddleware,
     authorizeLinkCreation,
-    zValidator('json', createBodySchema),
+    zValidator('json', createLinkSchema),
     async (c) => {
         const { long, short, expiresAt } = c.req.valid('json')
         const expiresAtDate = expiresAt
@@ -142,7 +130,7 @@ app.post(
 
         // Create the data and messages in one transaction,
         try {
-            const { link, events } = await prisma.$transaction(async (tx) => {
+            const link = await prisma.$transaction(async (tx) => {
                 const link = await tx.link.create({
                     data: {
                         short: shortLink,
@@ -156,42 +144,28 @@ app.post(
                         },
                     },
                 })
-                const events = await tx.linkChangedEvent.createManyAndReturn({
-                    data: createEventData<typeof link>(
-                        [
-                            Queues.LINKS_ANALYTICS_QUEUE,
-                            Queues.LINKS_LOOKUPS_QUEUE,
-                            Queues.LINKS_USERS_QUEUE,
-                        ],
-                        link
-                    ),
+                await tx.linkChangedEvent.createMany({
+                    data: createEventData<typeof link>(updateQueues, link),
                 })
 
-                return { link, events }
+                return link
             })
 
             // Send events
-            // This can fail partially or in total we will retry from a workflow
-            // Workflow has internal ways to retry multiple timess
-            const send = async (queue: string, data: any) =>
-                await c.env[queueBindings[queue as Queues]].send(data)
-
             try {
-                const sentCount = await sendEvents(
-                    prisma.linkChangedEvent,
-                    events,
-                    send
-                )
-                if (sentCount < events.length)
-                    throw Error('Some of the events are not sent')
+                const send = async (queue: string, data: any) =>
+                    await c.env[queueBindings[queue as QueuesToProduce]].send(
+                        data
+                    )
+                await sendEvents(prisma.linkChangedEvent, send)
             } catch (err) {
-                // TODO Implement the workflow
-                // Trigger the workflow
-                // Ok to continue we will retry later
+                // If something fails we can retry later
             }
 
             c.status(201)
-            return c.json({ ...link, v: undefined, deletedAt: undefined })
+            return c.json({
+                link: { ...link, v: undefined, deletedAt: undefined },
+            })
         } catch (err: any) {
             if (
                 err.name === 'PrismaClientKnownRequestError' &&
@@ -212,23 +186,6 @@ app.post(
     }
 )
 
-const updateBodySchema = z
-    .object({
-        long: z.optional(z.string().url()),
-        short: z.optional(z.string()),
-        expiresAt: z.optional(expires_at_validator),
-    })
-    .refine(
-        ({ long, expiresAt }) => long !== undefined || expiresAt !== undefined,
-        { message: 'One of the fields must be defined [long, expiresAt]' }
-    )
-    .refine(({ short }) => short === undefined, {
-        message: "'short': short link can not be changed",
-    })
-const updateParamSchema = z.object({
-    id: z.string().uuid(),
-})
-
 app.patch(
     '/links/:id',
     describeRoute({
@@ -238,25 +195,18 @@ app.patch(
                 description: 'Successful response',
                 content: {
                     'application/json': {
-                        schema: resolver(LinkSchema),
+                        schema: resolver(linkResponeSchema),
                     },
                 },
             },
         },
     }),
-    getAuthorizationData,
-    zValidator('json', updateBodySchema),
-    zValidator('param', updateParamSchema),
+    authenticateMiddleware,
+    zValidator('json', updateLinkSchema),
+    zValidator('param', paramLinkIdSchema),
     async (c) => {
         const { id } = c.req.valid('param')
         const { long, short, expiresAt } = c.req.valid('json')
-
-        if (
-            id !== c.var.authUserId &&
-            !c.var.scopes.has(Scopes.WriteAllLinks)
-        ) {
-            throw new NotAllowedError()
-        }
 
         const prisma = prismaClients.fetch(c.env.DATABASE_URL)
 
@@ -268,14 +218,15 @@ app.patch(
 
         // Update the data and messages in one transaction,
         try {
-            const { link, events } = await prisma.$transaction(async (tx) => {
+            const link = await prisma.$transaction(async (tx) => {
                 const link = await tx.link.update({
                     where: {
                         id,
-                        user: {
-                            id: c.var.authUserId,
-                            deletedAt: null,
-                        },
+                        userId: !c.var.permissions.has(
+                            Permissions.Link_WriteAll
+                        )
+                            ? c.var.authUserId
+                            : undefined,
                         deletedAt: null,
                     },
                     data: {
@@ -285,42 +236,31 @@ app.patch(
                         },
                     },
                 })
-                const events = await tx.linkChangedEvent.createManyAndReturn({
+                await tx.linkChangedEvent.createMany({
                     data: createEventData<PartialExceptVersion<typeof link>>(
-                        [
-                            Queues.LINKS_ANALYTICS_QUEUE,
-                            Queues.LINKS_LOOKUPS_QUEUE,
-                            Queues.LINKS_USERS_QUEUE,
-                        ],
+                        updateQueues,
                         { ...data, id: link.id, short: link.short, v: link.v }
                     ),
                 })
 
-                return { link, events }
+                return link
             })
 
             // Send events
-            // This can fail partially or in total we will retry from a workflow
-            // Workflow has internal ways to retry multiple timess
-            const send = async (queue: string, data: any) =>
-                await c.env[queueBindings[queue as Queues]].send(data)
-
             try {
-                const sentCount = await sendEvents(
-                    prisma.linkChangedEvent,
-                    events,
-                    send
-                )
-                if (sentCount < events.length)
-                    throw Error('Some of the events are not sent')
+                const send = async (queue: string, data: any) =>
+                    await c.env[queueBindings[queue as QueuesToProduce]].send(
+                        data
+                    )
+                await sendEvents(prisma.linkChangedEvent, send)
             } catch (err) {
-                // TODO Implement the workflow
-                // Trigger the workflow
-                // Ok to continue we will retry later
+                // If something fails we can retry later
             }
 
             c.status(200)
-            return c.json({ ...link, v: undefined, deletedAt: undefined })
+            return c.json({
+                link: { ...link, v: undefined, deletedAt: undefined },
+            })
         } catch (err: any) {
             if (
                 err.name === 'PrismaClientKnownRequestError' &&
@@ -346,34 +286,117 @@ app.delete(
                 description: 'Successful response',
                 content: {
                     'application/json': {
-                        schema: resolver(LinkSchema),
+                        schema: resolver(linkResponeSchema),
                     },
                 },
             },
         },
     }),
-    getAuthorizationData,
-    zValidator('param', updateParamSchema),
+    authenticateMiddleware,
+    zValidator('param', paramLinkIdSchema),
     async (c) => {
         const { id } = c.req.valid('param')
-
-        if (
-            id !== c.var.authUserId &&
-            !c.var.scopes.has(Scopes.WriteAllLinks)
-        ) {
-            throw new NotAllowedError()
-        }
 
         const prisma = prismaClients.fetch(c.env.DATABASE_URL)
 
         // Update the data and messages in one transaction
         try {
-            const { link, events } = await prisma.$transaction(async (tx) => {
+            const link = await prisma.$transaction(async (tx) => {
                 const link = await tx.link.update({
                     where: {
                         id,
+                        userId: !c.var.permissions.has(
+                            Permissions.Link_DeleteAll
+                        )
+                            ? c.var.authUserId
+                            : undefined,
+                        deletedAt: null,
+                    },
+                    data: {
+                        deletedAt: new Date(),
+                        v: {
+                            increment: 1,
+                        },
+                    },
+                })
+                await tx.linkChangedEvent.createMany({
+                    data: createEventData<PartialExceptVersion<typeof link>>(
+                        updateQueues,
+                        {
+                            id: link.id,
+                            short: link.short,
+                            deletedAt: link.deletedAt,
+                            v: link.v,
+                        }
+                    ),
+                })
+
+                return link
+            })
+
+            // Send events
+            try {
+                const send = async (queue: string, data: any) =>
+                    await c.env[queueBindings[queue as QueuesToProduce]].send(
+                        data
+                    )
+                await sendEvents(prisma.linkChangedEvent, send)
+            } catch (err) {
+                // If something fails we can retry later
+            }
+
+            return c.json({ link: { ...link, v: undefined } })
+        } catch (err: any) {
+            if (
+                err.name === 'PrismaClientKnownRequestError' &&
+                err.meta?.modelName === 'Link'
+            ) {
+                // P2002 - Unique constraint failed, record already exists, ack message
+                if (err.code === 'P2025') {
+                    throw new NotFoundError()
+                }
+            }
+            // rethrow
+            throw err
+        }
+    }
+)
+
+app.post(
+    '/links/bulk/delete',
+    describeRoute({
+        description: 'Bulk delete user resources',
+        responses: {
+            200: {
+                description: 'Successful response',
+                content: {
+                    'application/json': {
+                        schema: resolver(bulkDeletedResponseSchema),
+                    },
+                },
+            },
+        },
+    }),
+    authenticateMiddleware,
+    zValidator('json', bulkDeleteParamSchema),
+    async (c) => {
+        const { ids } = c.req.valid('json')
+        const prisma = prismaClients.fetch(c.env.DATABASE_URL)
+
+        // Update the data and messages in one transaction
+        try {
+            const links = await prisma.$transaction(async (tx) => {
+                const deletedLinks = await tx.link.updateManyAndReturn({
+                    where: {
+                        id: {
+                            in: ids,
+                        },
                         user: {
-                            id: c.var.authUserId,
+                            id: !c.var.permissions.has(
+                                Permissions.Link_DeleteAll
+                            )
+                                ? c.var.authUserId
+                                : undefined,
                             deletedAt: null,
                         },
                         deletedAt: null,
@@ -385,53 +408,45 @@ app.delete(
                         },
                     },
                 })
-                const events = await tx.linkChangedEvent.createManyAndReturn({
-                    data: createEventData<PartialExceptVersion<typeof link>>(
-                        [
-                            Queues.LINKS_ANALYTICS_QUEUE,
-                            Queues.LINKS_LOOKUPS_QUEUE,
-                            Queues.LINKS_USERS_QUEUE,
-                        ],
-                        {
-                            id: link.id,
-                            short: link.short,
-                            deletedAt: link.deletedAt,
-                            v: link.v,
-                        }
-                    ),
+                let eventData = []
+                for (const link of deletedLinks) {
+                    const data = createEventData<
+                        PartialExceptVersion<typeof link>
+                    >(updateQueues, {
+                        id: link.id,
+                        short: link.short,
+                        deletedAt: link.deletedAt,
+                        v: link.v,
+                    })
+                    eventData.push(...data)
+                }
+                await tx.linkChangedEvent.createMany({
+                    data: eventData,
                 })
 
-                return { link, events }
+                return deletedLinks
             })
 
             // Send events
-            // This can fail partially or in total we will retry from a workflow
-            // Workflow has internal ways to retry multiple timess
-            const send = async (queue: string, data: any) =>
-                await c.env[queueBindings[queue as Queues]].send(data)
-
             try {
-                const sentCount = await sendEvents(
-                    prisma.linkChangedEvent,
-                    events,
-                    send
-                )
-                if (sentCount < events.length)
-                    throw Error('Some of the events are not sent')
+                const send = async (queue: string, data: any) =>
+                    await c.env[queueBindings[queue as QueuesToProduce]].send(
+                        data
+                    )
+                await sendEvents(prisma.linkChangedEvent, send)
             } catch (err) {
-                // TODO Implement the workflow
-                // Trigger the workflow
-                // Ok to continue we will retry later
+                // If something fails we can retry later
             }
 
-            c.status(200)
-            return c.json({ ...link, v: undefined })
+            return c.json({
+                deleted: links.map((data) => data.id),
+            })
         } catch (err: any) {
             if (
                 err.name === 'PrismaClientKnownRequestError' &&
-                err.meta?.modelName === 'Link'
+                err.meta?.modelName === 'User'
             ) {
-                // P2002 - Unique constraint failed, record already exists, ack message
+                // P2025 - Record to update not found
                 if (err.code === 'P2025') {
                     throw new NotFoundError()
                 }
@@ -451,41 +466,34 @@ app.get(
                 description: 'Successful response',
                 content: {
                     'application/json': {
-                        schema: resolver(LinkSchema),
+                        schema: resolver(linkResponeSchema),
                     },
                 },
             },
         },
     }),
-    getAuthorizationData,
-    zValidator('param', updateParamSchema),
+    authenticateMiddleware,
+    zValidator('param', paramLinkIdSchema),
     async (c) => {
         const { id } = c.req.valid('param')
 
-        if (
-            id !== c.var.authUserId &&
-            !c.var.scopes.has(Scopes.WriteAllLinks)
-        ) {
-            throw new NotAllowedError()
-        }
-        console.log(c.var.authUserId, id)
         const prisma = prismaClients.fetch(c.env.DATABASE_URL)
         const link = await prisma.link.findUnique({
             where: {
                 id,
-                user: {
-                    id: c.var.authUserId,
-                    deletedAt: null,
-                },
+                userId: !c.var.permissions.has(Permissions.Link_ReadAll)
+                    ? c.var.authUserId
+                    : undefined,
                 deletedAt: null,
             },
+            omit: {
+                deletedAt: true,
+                v: true,
+            },
         })
-        console.log(link)
+
         if (link) {
-            c.status(200)
-            return c.json({
-                link: { ...link, deletedAt: undefined, v: undefined },
-            })
+            return c.json({ link })
         }
         throw new NotFoundError()
     }
@@ -500,42 +508,83 @@ app.get(
                 description: 'Successful response',
                 content: {
                     'application/json': {
-                        schema: resolver(LinkSchema),
+                        schema: resolver(paginatedLinksResponseSchema),
                     },
                 },
             },
         },
     }),
-    getAuthorizationData,
+    authenticateMiddleware,
     async (c) => {
+        const search = new URL(c.req.url).search.slice(1)
+        const query = listQuerySchema.parse(qs.parse(search))
+
+        const page = query?.page || 1
+        const limit = query?.limit || 10
+
+        const whereQuery: Prisma.LinkWhereInput = query?.where || {}
+
+        // If doesnt have Permissions.Link_ReadAll only return Links created by the user
+        if (c.var.permissions.has(Permissions.Link_ReadAll)) {
+            whereQuery.user = query?.where?.user
+            whereQuery.userId = undefined
+        } else {
+            whereQuery.user = undefined
+            whereQuery.userId = c.var.authUserId
+        }
+
+        whereQuery.deletedAt = null
+
         const prisma = prismaClients.fetch(c.env.DATABASE_URL)
         const links = await prisma.link.findMany({
-            where: {
-                user: {
-                    id: c.var.authUserId,
-                    deletedAt: null,
-                },
-                deletedAt: null,
+            where: whereQuery,
+            orderBy: query?.sort || undefined,
+            omit: {
+                deletedAt: true,
+                v: true,
             },
-            orderBy: {
-                createdAt: 'desc',
-            },
-            take: 100,
+            skip: (page - 1) * limit,
+            take: limit + 1,
+            include: query?.include?.user
+                ? {
+                      user: {
+                          select: {
+                              id: true,
+                              username: true,
+                          },
+                      },
+                  }
+                : undefined,
         })
-        c.status(200)
-        return c.json({ links })
+
+        const hasNextPage = links.length > limit
+        if (hasNextPage) links.pop()
+
+        return c.json({
+            docs: links,
+            pagination: {
+                page,
+                limit,
+                hasNextPage,
+                prev: page > 1 ? page - 1 : null,
+                next: hasNextPage ? page + 1 : null,
+            },
+        })
     }
 )
 
 app.onError((err, c) => {
-    console.log(err)
+    if (err instanceof ZodError) {
+        c.status(422)
+        return c.json({ error: err })
+    }
     const e = err instanceof CustomError ? err : new UnexpectedError()
     c.status(e.status)
     return c.json(e.toMessage())
 })
 
 app.get(
-    '/links/doc/openapi',
+    '/links/schema/openapi',
     openAPISpecs(app, {
         documentation: {
             info: {
@@ -555,8 +604,29 @@ app.get(
 
 export default {
     fetch: app.fetch,
-    async queue(batch: MessageBatch<UserChangedEventData>, env: Bindings) {
+    async queue(batch: MessageBatch, env: Bindings) {
         const prisma = prismaClients.fetch(env.DATABASE_URL)
-        await new SyncUserData(prisma).sync(batch)
+        switch (batch.queue) {
+            case ConsumerQueues.USERS_LINKS_QUEUE:
+                await new SyncUserData(prisma).sync(
+                    batch as MessageBatch<ResourceChangedEventDescriptor>
+                )
+                // Send possible cascade delete events
+                try {
+                    const send = async (queue: string, data: any) =>
+                        await env[queueBindings[queue as QueuesToProduce]].send(
+                            data
+                        )
+                    await sendEvents(prisma.linkChangedEvent, send)
+                } catch (err) {
+                    // If something fails we can retry later
+                }
+            case ConsumerQueues.LINKS_DLQ:
+                await handleDLQ(
+                    prisma,
+                    batch as MessageBatch<ResourceChangedEventDescriptor>
+                )
+                break
+        }
     },
 }

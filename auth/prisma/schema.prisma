@@ -18,7 +18,7 @@ datasource db {
 model User {
   id    String @id  @default(uuid())
   username String
-  scopes Json
+  permissions Json
   password String
   v	Int  @default(0)
   createdAt DateTime @default(now())

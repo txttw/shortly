@@ -22,3 +22,15 @@ export class UserHasLinkError extends CustomError {
         }
     }
 }
+
+export class AllUserHasLinkError extends CustomError {
+    status = 422 as StatusCode
+    constructor() {
+        super('Unable to delete. All user has active associated links')
+    }
+    toMessage(): ErrorMessageObject {
+        return {
+            message: 'Unable to delete.  All user has active associated links',
+        }
+    }
+}

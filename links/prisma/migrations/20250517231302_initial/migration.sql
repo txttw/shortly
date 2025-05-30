@@ -2,6 +2,7 @@
 CREATE TABLE "User" (
     "id" TEXT NOT NULL,
     "v" INTEGER NOT NULL,
+    "username" TEXT NOT NULL,
     "deletedAt" TIMESTAMP(3),
 
     CONSTRAINT "User_pkey" PRIMARY KEY ("id")
@@ -34,6 +35,9 @@ CREATE TABLE "LinkChangedEvent" (
 
 -- CreateIndex
 CREATE INDEX "User_id_deletedAt_idx" ON "User"("id", "deletedAt");
+
+-- CreateIndex
+CREATE INDEX "User_username_deletedAt_idx" ON "User"("username", "deletedAt");
 
 -- CreateIndex
 CREATE INDEX "Link_userId_createdAt_idx" ON "Link"("userId", "createdAt" DESC);

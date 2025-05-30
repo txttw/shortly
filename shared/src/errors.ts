@@ -1,5 +1,28 @@
 import { StatusCode } from './status-codes'
 
+export class JwtTokenInvalidFormat extends Error {
+    constructor() {
+        super('Jwt invalid format')
+    }
+}
+export class JwtTokenInvalidExpired extends Error {
+    constructor() {
+        super('Jwt expired')
+    }
+}
+export class JwtTokenInvalidSignature extends Error {
+    constructor() {
+        super('Jwt invalid signature')
+    }
+}
+export class JwtInvalidHeader extends Error {
+    constructor() {
+        super(
+            'Jwt invalid header. It should be an Authorization header with a Bearer token'
+        )
+    }
+}
+
 export interface ErrorMessageObject {
     message: string
 }
@@ -39,13 +62,13 @@ export class NotAllowedError extends CustomError {
     }
 }
 
-export class UnauthorizedError extends CustomError {
+export class UnauthenticatedError extends CustomError {
     status = 401 as StatusCode
     constructor() {
-        super('Unauthorized')
+        super('Not authenticated')
     }
     toMessage(): ErrorMessageObject {
-        return { message: 'Unauthorized' }
+        return { message: 'Not authenticated' }
     }
 }
 

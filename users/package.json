@@ -4,10 +4,10 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy --minify",
     "cf-typegen": "wrangler types --env-interface CloudflareBindings",
-	  "migrate": "dotenv -e .dev.vars -- npx prisma migrate dev",
-	  "generate": "dotenv -e .dev.vars -- npx prisma generate --no-engine",
+    "migrate": "dotenv -e .dev.vars -- npx prisma migrate dev",
+    "generate": "dotenv -e .dev.vars -- npx prisma generate --no-engine",
     "migrate-reset": "dotenv -e .dev.vars -- npx prisma migrate reset",
-	  "studio": "dotenv -e .dev.vars -- npx prisma studio"
+    "studio": "dotenv -e .dev.vars -- npx prisma studio"
   },
   "dependencies": {
     "@hono/zod-openapi": "^0.19.6",
@@ -17,6 +17,7 @@
     "@prisma/extension-accelerate": "^1.3.0",
     "hono": "^4.7.8",
     "hono-openapi": "^0.4.7",
+    "qs-esm": "^7.0.2",
     "shortly-shared": "file:../shared",
     "zod": "^3.24.3",
     "zod-openapi": "^4.2.4"

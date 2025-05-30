@@ -1,67 +1,90 @@
 import { Hono } from 'hono/quick'
-import { z } from 'zod'
+import { ZodError } from 'zod'
 import 'zod-openapi/extend'
+import { cors } from 'hono/cors'
 
 import prismaClients from '../lib/prismaClient'
 
 import { describeRoute, openAPISpecs } from 'hono-openapi'
 import { resolver, validator as zValidator } from 'hono-openapi/zod'
-import { UserAlreadyExists, UserHasLinkError } from './errors'
 import {
-    appDefaults,
+    AllUserHasLinkError,
+    UserAlreadyExists,
+    UserHasLinkError,
+} from './errors'
+import {
+    corsOptions,
     CustomError,
     hashPassword,
-    LinkChangedEventData,
     NotAllowedError,
     NotFoundError,
     PartialExceptVersion,
-    Scopes,
+    Permissions,
+    ResourceChangedEventDescriptor,
     UnexpectedError,
 } from 'shortly-shared'
 import { createEventData, sendEvents } from 'shortly-shared'
 import {
+    authenticateMiddleware,
+    authorizeDeleteUsers,
     authorizeListUsers,
     authorizeUserCreation,
-    getAuthorizationData,
 } from './middleware/authorization'
-import { SyncLinkData } from './event-processing'
+import { handleDLQ, SyncLinkData } from './event-processing'
+import * as qs from 'qs-esm'
+import {
+    bulkDeleteParamSchema,
+    createUserSchema,
+    listQuerySchema,
+    paginatedLinksResponseSchema,
+    paramUserIdSchema,
+    updateUserSchema,
+    userResponeSchema,
+} from './validation/users'
 
 type DBBindings = {
     DATABASE_URL: string
 }
 
 type QueueBindings = {
-    USERS_API_GW_QUEUE: Queue
+    USERS_AUTH_QUEUE: Queue
     USERS_LINKS_QUEUE: Queue
     USERS_ANALYTICS_QUEUE: Queue
 }
 
 type Bindings = DBBindings & QueueBindings
 
-enum Queues {
-    USERS_API_GW_QUEUE = 'shortly-users-api-gw',
+// consume from queue
+enum ConsumerQueues {
+    LINKS_USERS_QUEUE = 'shortly-links-users',
+    USERS_DLQ = 'shortly-users-dlq',
+}
+
+// Produce to queues
+enum QueuesToProduce {
+    USERS_AUTH_QUEUE = 'shortly-users-auth',
     USERS_LINKS_QUEUE = 'shortly-users-links',
     USERS_ANALYTICS_QUEUE = 'shortly-users-analytics',
 }
 
-const queueBindings: { [key in Queues]: keyof QueueBindings } = {
-    [Queues.USERS_API_GW_QUEUE]: 'USERS_API_GW_QUEUE',
-    [Queues.USERS_LINKS_QUEUE]: 'USERS_LINKS_QUEUE',
-    [Queues.USERS_ANALYTICS_QUEUE]: 'USERS_ANALYTICS_QUEUE',
+export const updateQueues = [
+    QueuesToProduce.USERS_AUTH_QUEUE,
+    QueuesToProduce.USERS_LINKS_QUEUE,
+    QueuesToProduce.USERS_ANALYTICS_QUEUE,
+]
+
+const queueBindings: { [key in QueuesToProduce]: keyof QueueBindings } = {
+    [QueuesToProduce.USERS_AUTH_QUEUE]: 'USERS_AUTH_QUEUE',
+    [QueuesToProduce.USERS_LINKS_QUEUE]: 'USERS_LINKS_QUEUE',
+    [QueuesToProduce.USERS_ANALYTICS_QUEUE]: 'USERS_ANALYTICS_QUEUE',
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
 
-const createBodySchema = z.object({
-    username: z.string().min(2).max(25).openapi({ example: 'john' }),
-    password: z.string().min(appDefaults.auth.pwMinLength),
-})
+app.use('*', cors(corsOptions))
 
-const UserSchema = z.object({
-    username: z.string().openapi({ example: 'steven' }),
-    id: z.string(),
-    createdAt: z.date(),
-})
+// provide default permissions
+const minimlaPermissions = [Permissions.Link_Create]
 
 app.post(
     '/users',
@@ -72,74 +95,74 @@ app.post(
                 description: 'Successful response',
                 content: {
                     'application/json': {
-                        schema: resolver(UserSchema),
+                        schema: resolver(userResponeSchema),
                     },
                 },
             },
         },
     }),
-    getAuthorizationData,
+    authenticateMiddleware,
     authorizeUserCreation,
-    zValidator('json', createBodySchema),
+    zValidator('json', createUserSchema),
     async (c) => {
-        const { username, password } = c.req.valid('json')
+        const { username, password, permissions = [] } = c.req.valid('json')
         const prisma = prismaClients.fetch(c.env.DATABASE_URL)
 
-        // provide default scopes, it can be changed later with user update
-        const defaultScopes = [Scopes.CreateLink, Scopes.ReadAnalytics]
+        // Check grant permissions
+        if (!c.var.permissions.has(Permissions.Grant_All)) {
+            // Grant_Owned means they can grant only what they own
+            const allowed = c.var.permissions.intersection(new Set(permissions))
+            if (
+                !c.var.permissions.has(Permissions.Grant_Owned) ||
+                allowed.size < permissions.length
+            ) {
+                throw new NotAllowedError()
+            }
+        }
 
         const hashed = await hashPassword(password)
 
         // Create the data and messages in one transaction
         try {
-            const { user, events } = await prisma.$transaction(async (tx) => {
+            const user = await prisma.$transaction(async (tx) => {
                 const user = await tx.user.create({
                     data: {
                         username,
                         password: hashed,
-                        scopes: defaultScopes,
+                        // Ensure minimal permissions are given
+                        permissions: [
+                            ...new Set(permissions).union(
+                                new Set(minimlaPermissions)
+                            ),
+                        ].sort(),
                     },
                 })
-                const events = await tx.userChangedEvent.createManyAndReturn({
-                    data: createEventData<typeof user>(
-                        [
-                            Queues.USERS_API_GW_QUEUE,
-                            Queues.USERS_LINKS_QUEUE,
-                            Queues.USERS_ANALYTICS_QUEUE,
-                        ],
-                        user
-                    ),
+                await tx.userChangedEvent.createMany({
+                    data: createEventData<typeof user>(updateQueues, user),
                 })
 
-                return { user, events }
+                return user
             })
 
             // Send events
-            // This can fail partially or in total we will retry from a workflow
-            // Workflow has internal ways to retry multiple timess
-            const send = async (queue: string, data: any) =>
-                await c.env[queueBindings[queue as Queues]].send(data)
-
             try {
-                const sentCount = await sendEvents(
-                    prisma.userChangedEvent,
-                    events,
-                    send
-                )
-                if (sentCount < events.length)
-                    throw Error('Some of the events are not sent')
+                const send = async (queue: string, data: any) =>
+                    await c.env[queueBindings[queue as QueuesToProduce]].send(
+                        data
+                    )
+                await sendEvents(prisma.userChangedEvent, send)
             } catch (err) {
-                // TODO Implement the workflow
-                // Trigger the workflow
-                // Ok to continue we will retry later
+                // If something fails we can retry later
             }
 
             c.status(201)
             return c.json({
-                ...user,
-                password: undefined,
-                v: undefined,
-                deletedAt: undefined,
+                user: {
+                    ...user,
+                    password: undefined,
+                    v: undefined,
+                    deletedAt: undefined,
+                },
             })
         } catch (err: any) {
             if (
@@ -157,23 +180,6 @@ app.post(
     }
 )
 
-const updateBodySchema = z
-    .object({
-        username: z
-            .optional(z.string().min(2).max(25))
-            .openapi({ example: 'john' }),
-        scopes: z.optional(z.array(z.nativeEnum(Scopes))),
-        password: z.optional(z.string().min(appDefaults.auth.pwMinLength)),
-    })
-    .refine(
-        ({ username, scopes }) =>
-            username !== undefined || scopes !== undefined,
-        { message: 'One of the fields must be defined' }
-    )
-const updateParamSchema = z.object({
-    id: z.string().uuid(),
-})
-
 app.patch(
     '/users/:id',
     describeRoute({
@@ -183,41 +189,53 @@ app.patch(
                 description: 'Successful response',
                 content: {
                     'application/json': {
-                        schema: resolver(UserSchema),
+                        schema: resolver(userResponeSchema),
                     },
                 },
             },
         },
     }),
-    zValidator('json', updateBodySchema),
-    zValidator('param', updateParamSchema),
-    getAuthorizationData,
+    zValidator('json', updateUserSchema),
+    zValidator('param', paramUserIdSchema),
+    authenticateMiddleware,
     async (c) => {
         const { id } = c.req.valid('param')
-        const { username, scopes, password } = c.req.valid('json')
+        const { username, permissions, password } = c.req.valid('json')
         const prisma = prismaClients.fetch(c.env.DATABASE_URL)
 
         if (
             id !== c.var.authUserId &&
-            !c.var.scopes.has(Scopes.WriteAllUsers)
+            !c.var.permissions.has(Permissions.User_WriteAll)
         ) {
             throw new NotAllowedError()
         }
 
-        if (scopes) {
-            const allowed = c.var.scopes.intersection(new Set(scopes))
-            if (allowed.size < scopes.length) {
+        // Check grant permissions
+        if (permissions && !c.var.permissions.has(Permissions.Grant_All)) {
+            // Grant_Owned means they can grant only what they own
+            const allowed = c.var.permissions.intersection(new Set(permissions))
+            if (
+                !c.var.permissions.has(Permissions.Grant_Owned) ||
+                allowed.size < permissions.length
+            ) {
                 throw new NotAllowedError()
             }
         }
         const data = {
             username,
-            scopes,
+            // Ensure minimal permissions not revoked
+            permissions: permissions
+                ? [
+                      ...new Set(permissions).union(
+                          new Set(minimlaPermissions)
+                      ),
+                  ].sort()
+                : undefined,
             password: password ? await hashPassword(password) : undefined,
         }
         // Update the data and messages in one transaction
         try {
-            const { user, events } = await prisma.$transaction(async (tx) => {
+            const user = await prisma.$transaction(async (tx) => {
                 const user = await tx.user.update({
                     where: {
                         id,
@@ -229,48 +247,38 @@ app.patch(
                             increment: 1,
                         },
                     },
+                    omit: {
+                        password: true,
+                    },
                 })
 
-                const events = await tx.userChangedEvent.createManyAndReturn({
+                await tx.userChangedEvent.createMany({
                     data: createEventData<PartialExceptVersion<typeof user>>(
-                        [
-                            Queues.USERS_API_GW_QUEUE,
-                            Queues.USERS_LINKS_QUEUE,
-                            Queues.USERS_ANALYTICS_QUEUE,
-                        ],
+                        updateQueues,
                         { ...data, id: user.id, v: user.v }
                     ),
                 })
 
-                return { user, events }
+                return user
             })
 
             // Send events
-            // This can fail partially or in total we will retry from a workflow
-            // Workflow has internal ways to retry multiple timess
-            const send = async (queue: string, data: any) =>
-                await c.env[queueBindings[queue as Queues]].send(data)
-
             try {
-                const sentCount = await sendEvents(
-                    prisma.userChangedEvent,
-                    events,
-                    send
-                )
-                if (sentCount < events.length)
-                    throw Error('Some of the events are not sent')
+                const send = async (queue: string, data: any) =>
+                    await c.env[queueBindings[queue as QueuesToProduce]].send(
+                        data
+                    )
+                await sendEvents(prisma.userChangedEvent, send)
             } catch (err) {
-                // TODO Implement the workflow
-                // Trigger the workflow
-                // Ok to continue we will retry later
+                // If something fails we can retry later
             }
 
-            c.status(200)
             return c.json({
-                ...user,
-                password: undefined,
-                v: undefined,
-                deletedAt: undefined,
+                user: {
+                    ...user,
+                    v: undefined,
+                    deletedAt: undefined,
+                },
             })
         } catch (err: any) {
             if (
@@ -297,21 +305,21 @@ app.delete(
                 description: 'Successful response',
                 content: {
                     'application/json': {
-                        schema: resolver(UserSchema),
+                        schema: resolver(userResponeSchema),
                     },
                 },
             },
         },
     }),
-    getAuthorizationData,
-    zValidator('param', updateParamSchema),
+    authenticateMiddleware,
+    zValidator('param', paramUserIdSchema),
     async (c) => {
         const { id } = c.req.valid('param')
         const prisma = prismaClients.fetch(c.env.DATABASE_URL)
 
         if (
             id !== c.var.authUserId &&
-            !c.var.scopes.has(Scopes.WriteAllUsers)
+            !c.var.permissions.has(Permissions.User_DeleteAll)
         ) {
             throw new NotAllowedError()
         }
@@ -335,7 +343,7 @@ app.delete(
 
         // Update the data and messages in one transaction
         try {
-            const { user, events } = await prisma.$transaction(async (tx) => {
+            const user = await prisma.$transaction(async (tx) => {
                 const user = await tx.user.update({
                     where: {
                         id,
@@ -347,43 +355,147 @@ app.delete(
                             increment: 1,
                         },
                     },
+                    omit: {
+                        password: true,
+                    },
                 })
-                const events = await tx.userChangedEvent.createManyAndReturn({
+                await tx.userChangedEvent.createMany({
                     data: createEventData<PartialExceptVersion<typeof user>>(
-                        [
-                            Queues.USERS_API_GW_QUEUE,
-                            Queues.USERS_LINKS_QUEUE,
-                            Queues.USERS_ANALYTICS_QUEUE,
-                        ],
+                        updateQueues,
                         { id: user.id, deletedAt: user.deletedAt, v: user.v }
                     ),
                 })
 
-                return { user, events }
+                return user
             })
 
             // Send events
-            // This can fail partially or in total we will retry from a workflow
-            // Workflow has internal ways to retry multiple timess
-            const send = async (queue: string, data: any) =>
-                await c.env[queueBindings[queue as Queues]].send(data)
-
             try {
-                const sentCount = await sendEvents(
-                    prisma.userChangedEvent,
-                    events,
-                    send
-                )
-                if (sentCount < events.length)
-                    throw Error('Some of the events are not sent')
+                const send = async (queue: string, data: any) =>
+                    await c.env[queueBindings[queue as QueuesToProduce]].send(
+                        data
+                    )
+                await sendEvents(prisma.userChangedEvent, send)
             } catch (err) {
-                // TODO Implement the workflow
-                // Trigger the workflow
-                // Ok to continue we will retry later
+                // If something fails we can retry later
             }
 
-            c.status(200)
-            return c.json({ ...user, password: undefined, v: undefined })
+            return c.json({
+                user: { ...user, v: undefined },
+            })
+        } catch (err: any) {
+            if (
+                err.name === 'PrismaClientKnownRequestError' &&
+                err.meta?.modelName === 'User'
+            ) {
+                // P2025 - Record to update not found
+                if (err.code === 'P2025') {
+                    throw new NotFoundError()
+                }
+            }
+            // rethrow
+            throw err
+        }
+    }
+)
+
+app.post(
+    '/users/bulk/delete',
+    describeRoute({
+        description: 'Bulk delete user resources',
+        responses: {
+            200: {
+                description: 'Successful response',
+                content: {
+                    'application/json': {
+                        schema: resolver(userResponeSchema),
+                    },
+                },
+            },
+        },
+    }),
+    authenticateMiddleware,
+    authorizeDeleteUsers,
+    zValidator('json', bulkDeleteParamSchema),
+    async (c) => {
+        const { ids } = c.req.valid('json')
+        const prisma = prismaClients.fetch(c.env.DATABASE_URL)
+
+        if (!c.var.permissions.has(Permissions.User_DeleteAll)) {
+            throw new NotAllowedError()
+        }
+
+        // Update the data and messages in one transaction
+        try {
+            const users = await prisma.$transaction(async (tx) => {
+                const userIdsWithoutLinks = await tx.user.findMany({
+                    where: {
+                        id: {
+                            in: ids,
+                        },
+                        links: {
+                            none: {
+                                expiresAt: { gt: new Date() },
+                                deletedAt: null,
+                            },
+                        },
+                    },
+                    select: {
+                        id: true,
+                    },
+                })
+                if (userIdsWithoutLinks.length === 0) {
+                    throw new AllUserHasLinkError()
+                }
+                const deletedUsers = await tx.user.updateManyAndReturn({
+                    where: {
+                        id: {
+                            in: userIdsWithoutLinks.map((u) => u.id),
+                        },
+                        deletedAt: null,
+                    },
+                    data: {
+                        deletedAt: new Date(),
+                        v: {
+                            increment: 1,
+                        },
+                    },
+                    omit: {
+                        password: true,
+                    },
+                })
+                let eventData = []
+                for (const user of deletedUsers) {
+                    const data = createEventData<
+                        PartialExceptVersion<typeof user>
+                    >(updateQueues, {
+                        id: user.id,
+                        deletedAt: user.deletedAt,
+                        v: user.v,
+                    })
+                    eventData.push(...data)
+                }
+                await tx.userChangedEvent.createMany({
+                    data: eventData,
+                })
+
+                return deletedUsers
+            })
+
+            // Send events
+            try {
+                const send = async (queue: string, data: any) =>
+                    await c.env[queueBindings[queue as QueuesToProduce]].send(
+                        data
+                    )
+                await sendEvents(prisma.userChangedEvent, send)
+            } catch (err) {
+                // If something fails we can retry later
+            }
+
+            return c.json({
+                deleted: users.map((data) => data.id),
+            })
         } catch (err: any) {
             if (
                 err.name === 'PrismaClientKnownRequestError' &&
@@ -409,19 +521,22 @@ app.get(
                 description: 'Successful response',
                 content: {
                     'application/json': {
-                        schema: resolver(UserSchema),
+                        schema: resolver(userResponeSchema),
                     },
                 },
             },
         },
     }),
-    getAuthorizationData,
-    zValidator('param', updateParamSchema),
+    authenticateMiddleware,
+    zValidator('param', paramUserIdSchema),
     async (c) => {
         const { id } = c.req.valid('param')
         const prisma = prismaClients.fetch(c.env.DATABASE_URL)
 
-        if (id !== c.var.authUserId && !c.var.scopes.has(Scopes.ReadAllUsers)) {
+        if (
+            id !== c.var.authUserId &&
+            !c.var.permissions.has(Permissions.User_ReadAll)
+        ) {
             throw new NotAllowedError()
         }
 
@@ -430,15 +545,15 @@ app.get(
                 id,
                 deletedAt: null,
             },
+            omit: {
+                password: true,
+                v: true,
+                deletedAt: true,
+            },
         })
+
         if (user) {
-            c.status(200)
-            return c.json({
-                ...user,
-                password: undefined,
-                v: undefined,
-                deletedAt: undefined,
-            })
+            return c.json({ user })
         }
 
         throw new NotFoundError()
@@ -454,46 +569,65 @@ app.get(
                 description: 'Successful response',
                 content: {
                     'application/json': {
-                        schema: resolver(z.array(UserSchema)),
+                        schema: resolver(paginatedLinksResponseSchema),
                     },
                 },
             },
         },
     }),
-    getAuthorizationData,
+    authenticateMiddleware,
     authorizeListUsers,
     async (c) => {
+        const search = new URL(c.req.url).search.slice(1)
+        const query = listQuerySchema.parse(qs.parse(search))
+
+        const page = query?.page || 1
+        const limit = query?.limit || 10
+
         const prisma = prismaClients.fetch(c.env.DATABASE_URL)
         const users = await prisma.user.findMany({
             where: {
+                ...(query?.where || {}),
                 deletedAt: null,
             },
-            orderBy: {
-                createdAt: 'desc',
+            orderBy: query?.sort || undefined,
+            omit: {
+                deletedAt: true,
+                password: true,
+                v: true,
             },
-            take: 100,
+            skip: (page - 1) * limit,
+            take: limit + 1,
         })
 
+        const hasNextPage = users.length > limit
+        if (hasNextPage) users.pop()
+
         return c.json({
-            users: users.map((user) => ({
-                ...user,
-                password: undefined,
-                v: undefined,
-                deletedAt: undefined,
-            })),
+            docs: users,
+            pagination: {
+                page,
+                limit,
+                hasNextPage,
+                prev: page > 1 ? page - 1 : null,
+                next: hasNextPage ? page + 1 : null,
+            },
         })
     }
 )
 
 app.onError((err, c) => {
-    console.log(err)
+    if (err instanceof ZodError) {
+        c.status(422)
+        return c.json({ error: err })
+    }
     const e = err instanceof CustomError ? err : new UnexpectedError()
     c.status(e.status)
     return c.json(e.toMessage())
 })
 
 app.get(
-    '/users/doc/openapi',
+    '/users/schema/openapi',
     openAPISpecs(app, {
         documentation: {
             info: {
@@ -507,8 +641,20 @@ app.get(
 
 export default {
     fetch: app.fetch,
-    async queue(batch: MessageBatch<LinkChangedEventData>, env: Bindings) {
+    async queue(batch: MessageBatch, env: Bindings) {
         const prisma = prismaClients.fetch(env.DATABASE_URL)
-        const results = await new SyncLinkData(prisma).sync(batch)
+        switch (batch.queue) {
+            case ConsumerQueues.LINKS_USERS_QUEUE:
+                await new SyncLinkData(prisma).sync(
+                    batch as MessageBatch<ResourceChangedEventDescriptor>
+                )
+                break
+            case ConsumerQueues.USERS_DLQ:
+                await handleDLQ(
+                    prisma,
+                    batch as MessageBatch<ResourceChangedEventDescriptor>
+                )
+                break
+        }
     },
 }

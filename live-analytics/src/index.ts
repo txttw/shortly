@@ -1,9 +1,14 @@
 import { DurableObject } from 'cloudflare:workers'
-import { appConstants, AuthorizationResult, Scopes } from 'shortly-shared'
+import {
+	AuthorizationResult,
+	base64Decode,
+	Permissions,
+	verifyJWT,
+} from 'shortly-shared'
 
 export interface Env {
 	LA_WEBSOCKET_SERVER: DurableObjectNamespace<LiveAnalytics>
-	SERVICE_API_GATEWAY: Service
+	SIGN_KEY: string
 }
 
 export class LiveAnalytics extends DurableObject<Env> {
@@ -22,7 +27,6 @@ export class LiveAnalytics extends DurableObject<Env> {
 		// WebSocket receives a message, the runtime will recreate the Durable Object
 		// (run the `constructor`) and deliver the message to the appropriate handler.
 		this.ctx.acceptWebSocket(server)
-
 		return new Response(null, {
 			status: 101,
 			webSocket: client,
@@ -68,7 +72,16 @@ export default {
 		const token = url.searchParams.get('token')
 		const apiKey = url.searchParams.get('apikey')
 
-		if (parts.length > 0 && parts[0] === 'websocket' && (token || apiKey)) {
+		if (!token) {
+			return new Response(null, {
+				status: 401,
+				headers: {
+					'Content-Type': 'text/plain',
+				},
+			})
+		}
+
+		if (parts.length > 0 && parts[0] === 'websocket') {
 			// Expect to receive a WebSocket Upgrade request.
 			// If there is one, accept the request and return a WebSocket Response.
 			const upgradeHeader = request.headers.get('Upgrade')
@@ -80,18 +93,33 @@ export default {
 					}
 				)
 			}
-			const auth: AuthorizationResult = token
-				? await env.SERVICE_API_GATEWAY.authorizeToken(token)
-				: await env.SERVICE_API_GATEWAY.authorizeAPIKey(apiKey)
 
-			if (auth) {
-				const scopes = new Set(auth.scopes)
-				if (scopes.has(Scopes.ReadAnalytics)) {
+			try {
+				const payload = await verifyJWT(
+					base64Decode(env.SIGN_KEY),
+					token
+				)
+				const auth: AuthorizationResult = {
+					id: payload.sub as string,
+					permissions: payload.perm as Array<Permissions>,
+				}
+
+				const permissions = new Set(auth.permissions)
+				if (
+					permissions.has(Permissions.Analytics_Read) &&
+					permissions.has(Permissions.Analytics_ReadLive)
+				) {
 					const id = env.LA_WEBSOCKET_SERVER.idFromName(auth.id)
 					const stub = env.LA_WEBSOCKET_SERVER.get(id)
-
 					return stub.fetch(request)
 				}
+			} catch (err) {
+				return new Response(null, {
+					status: 401,
+					headers: {
+						'Content-Type': 'text/plain',
+					},
+				})
 			}
 		}
 

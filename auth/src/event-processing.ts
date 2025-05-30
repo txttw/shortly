@@ -1,10 +1,10 @@
 import { UserChangedEventData } from 'shortly-shared'
 import { SyncServiceData } from 'shortly-shared'
 import { PrismaClientAccelerated } from '../lib/prismaClient'
-import { JsonArray, JsonValue } from '@prisma/client/runtime/edge'
+import { JsonValue } from '@prisma/client/runtime/edge'
 
 interface ModelData {
-    scopes: JsonValue
+    permissions: JsonValue
     id: string
     v: number
     deletedAt: Date | null
@@ -21,7 +21,7 @@ export class SyncUserData extends SyncServiceData<
                 id: data.id,
                 username: data.username,
                 v: data.v,
-                scopes: data.scopes,
+                permissions: data.permissions,
                 password: data.password,
                 deletedAt: data.deletedAt,
             },
@@ -36,7 +36,7 @@ export class SyncUserData extends SyncServiceData<
             data: {
                 username: data.username,
                 v: data.v,
-                scopes: data.scopes,
+                permissions: data.permissions,
                 password: data.password,
                 deletedAt: data.deletedAt,
             },

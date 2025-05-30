@@ -1,6 +1,7 @@
 -- CreateTable
 CREATE TABLE "User" (
     "id" TEXT NOT NULL,
+    "username" TEXT NOT NULL,
     "v" INTEGER NOT NULL,
     "deletedAt" TIMESTAMP(3),
 
@@ -17,6 +18,7 @@ CREATE TABLE "Link" (
     "count" INTEGER NOT NULL DEFAULT 0,
     "expiresAt" TIMESTAMP(3) NOT NULL,
     "deletedAt" TIMESTAMP(3),
+    "lastLookup" TIMESTAMP(3),
 
     CONSTRAINT "Link_pkey" PRIMARY KEY ("id")
 );

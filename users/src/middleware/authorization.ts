@@ -1,23 +1,36 @@
 import { createMiddleware } from 'hono/factory'
-import { Scopes, NotAllowedError } from 'shortly-shared'
+import {
+    Permissions,
+    NotAllowedError,
+    appConstants,
+    authJWT,
+    UnauthenticatedError,
+} from 'shortly-shared'
 
-// This middleware gets auth data provided by gateway service.
-export const getAuthorizationData = createMiddleware<{
+export const authenticateMiddleware = createMiddleware<{
+    Bindings: {
+        SIGN_KEY: string
+    }
     Variables: {
         authUserId: string | undefined
-        scopes: Set<Scopes>
+        permissions: Set<Permissions>
     }
 }>(async (c, next) => {
-    c.set('authUserId', c.req.header('X-Authenticated-User'))
-    c.set(
-        'scopes',
-        new Set(JSON.parse(c.req.header('X-User-Capabilities') || '[]'))
-    )
-    await next()
+    try {
+        const auth = await authJWT(
+            c.env.SIGN_KEY,
+            c.req.header('authorization')
+        )
+        c.set('authUserId', auth.id)
+        c.set('permissions', new Set(auth.permissions))
+        await next()
+    } catch (err: unknown) {
+        throw new UnauthenticatedError()
+    }
 })
 
 export const authorizeUserCreation = createMiddleware(async (c, next) => {
-    if (!c.var.scopes.has(Scopes.CreateUser)) {
+    if (!c.var.permissions.has(Permissions.User_Create)) {
         throw new NotAllowedError()
     }
 
@@ -25,7 +38,15 @@ export const authorizeUserCreation = createMiddleware(async (c, next) => {
 })
 
 export const authorizeListUsers = createMiddleware(async (c, next) => {
-    if (!c.var.scopes.has(Scopes.ReadAllUsers)) {
+    if (!c.var.permissions.has(Permissions.User_ReadAll)) {
+        throw new NotAllowedError()
+    }
+
+    await next()
+})
+
+export const authorizeDeleteUsers = createMiddleware(async (c, next) => {
+    if (!c.var.permissions.has(Permissions.User_DeleteAll)) {
         throw new NotAllowedError()
     }
 

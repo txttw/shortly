@@ -42,19 +42,28 @@
             {
                 "queue": "shortly-users-analytics",
                 "max_batch_size": 20,
-                "max_batch_timeout": 5
+                "max_batch_timeout": 2,
+                "retry_delay": 5,
+                "dead_letter_queue": "shortly-users-dlq"
             },
             {
                 "queue": "shortly-links-analytics",
                 "max_batch_size": 20,
-                "max_batch_timeout": 5
+                "max_batch_timeout": 2,
+                "retry_delay": 5,
+                "dead_letter_queue": "shortly-links-dlq"
             },
             {
                 "queue": "shortly-lookups-analytics",
                 "max_batch_size": 20,
-                "max_batch_timeout": 3
+                "max_batch_timeout": 3,
+                "retry_delay": 5
             }
         ]
+    },
+    "route": {
+        "pattern": "api.shortly.txttw.online/analytics*",
+        "zone_name": "txttw.online"
     }
 
     // "ai": {

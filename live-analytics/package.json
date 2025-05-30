@@ -9,6 +9,7 @@
 		"cf-typegen": "wrangler types"
 	},
 	"dependencies": {
+		"@types/node": "^22.15.24",
 		"shortly-shared": "file:../shared"
 	},
 	"devDependencies": {

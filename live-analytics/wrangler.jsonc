@@ -7,6 +7,7 @@
 	"name": "live-analytics",
 	"main": "src/index.ts",
 	"compatibility_date": "2025-05-02",
+	"compatibility_flags": ["nodejs_compat"],
 	"migrations": [
 		{
 			"new_sqlite_classes": ["LiveAnalytics"],
@@ -33,16 +34,9 @@
 			}
 		]
 	},
-	"services": [
-		{
-			"binding": "SERVICE_API_GATEWAY",
-			"service": "shortly-api-gateway",
-			"entrypoint": "RemoteAuth"
-		}
-	],
 	"route": {
 		"pattern": "live.shortly.txttw.online",
-		"custom_domain": true
+		"zone_name": "txttw.online"
 	}
 	/**
 	 * Smart Placement

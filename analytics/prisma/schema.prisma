@@ -17,6 +17,7 @@ datasource db {
 
 model User {
   id    String @id  @default(uuid())
+  username String
   v	Int
   deletedAt DateTime?
   links Link[]
@@ -33,6 +34,7 @@ model Link {
   count Int @default(0)
   expiresAt DateTime
   deletedAt DateTime?
+  lastLookup DateTime?
   @@index([short, userId])
   @@unique([short, deletedAt])
   @@index([short, expiresAt])
